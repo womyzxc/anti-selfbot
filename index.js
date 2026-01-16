@@ -15,31 +15,47 @@ let antiNukeEnabled = true;
 let trustedUsers = new Set(config.trustedIds);
 let whitelistRolesSet = new Set(config.whitelistRoles);
 
-// 🚦 RATE LIMIT MANAGER
+// Rate limiting
 const rateLimits = new Map();
 const processingGuilds = new Set();
+const recentJoins = new Map();
+const joinGracePeriod = 10000; // 10 seconds
 
-// 🛡️ SMART WHITELIST CHECK
+console.log('🤖 Anti-Nuke v4.2 starting...');
+
+const client = new Client({
+    intents: [
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildMembers,
+        GatewayIntentBits.GuildBans,
+        GatewayIntentBits.GuildModeration,
+        GatewayIntentBits.GuildWebhooks,
+        GatewayIntentBits.GuildInvites,
+        GatewayIntentBits.GuildIntegrations,
+        GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.MessageContent
+    ]
+});
+
 function isWhitelisted(member) {
-    // Trusted users OR bot OR has whitelist role
     return trustedUsers.has(member.id) || 
            member.user.bot ||
            Array.from(whitelistRolesSet).some(roleId => member.roles.cache.has(roleId));
 }
 
-// 🕒 NEW JOIN PROTECTION (Smart - 10s grace period)
-const recentJoins = new Map(); // userId -> joinTime
-const joinGracePeriod = 10000; // 10 seconds safe period
+function canKick(guildId) {
+    const now = Date.now();
+    const guildData = rateLimits.get(guildId);
+    return !guildData || now >= guildData.nextKick;
+}
 
 function isSuspiciousJoin(member) {
     const joinTime = recentJoins.get(member.id);
     if (!joinTime) return false;
-    
     const age = Date.now() - joinTime;
     return age > joinGracePeriod && !isWhitelisted(member);
 }
 
-// 🔥 SMART MASS KICK (Rate limit proof)
 async function massKick(guild, reason) {
     const guildId = guild.id;
     if (!antiNukeEnabled || trustedUsers.has(guild.ownerId) || processingGuilds.has(guildId)) {
@@ -47,11 +63,11 @@ async function massKick(guild, reason) {
     }
     
     processingGuilds.add(guildId);
-    console.log(`💥 [${guild.name}] Mass kick START (${reason})`);
+    console.log(`💥 [${guild.name}] Mass kick: ${reason}`);
     
     try {
         const members = await guild.members.fetch();
-        let kicked = 0, protectedCount = 0, newJoinCount = 0;
+        let kicked = 0, protectedCount = 0, graceCount = 0;
         const queue = [];
         
         for (const member of members.values()) {
@@ -60,24 +76,19 @@ async function massKick(guild, reason) {
                 continue;
             }
             
-            // Skip recent legit joins (within 10s)
             if (recentJoins.has(member.id) && (Date.now() - recentJoins.get(member.id)) < joinGracePeriod) {
-                newJoinCount++;
+                graceCount++;
                 continue;
             }
             
-            if (member.kickable) {
-                queue.push(member);
-            }
+            if (member.kickable) queue.push(member);
         }
         
-        console.log(`📋 [${guild.name}] Queue: ${queue.length} | Protected: ${protectedCount} | New joins: ${newJoinCount}`);
+        console.log(`📋 Queue:${queue.length} Protected:${protectedCount} Grace:${graceCount}`);
         
-        // Rate limited sequential kicks
         for (let i = 0; i < queue.length; i++) {
             const member = queue[i];
             
-            // Rate limit check
             while (!canKick(guildId)) {
                 const delay = rateLimits.get(guildId).nextKick - Date.now() + 100;
                 await new Promise(r => setTimeout(r, delay));
@@ -88,74 +99,75 @@ async function massKick(guild, reason) {
                 kicked++;
                 await logAction(guild, member, reason);
                 
-                // Rate limit update
                 const nextKick = Date.now() + 60 + Math.random() * 20;
                 rateLimits.set(guildId, { nextKick });
                 
-                console.log(`✅ [${guild.name}] ${kicked}/${queue.length} ${member.user.tag}`);
-                
             } catch (e) {
-                console.log(`⚠️ Skip ${member.user.tag}: ${e.message}`);
+                console.log(`⚠️ Skip ${member.user.tag}`);
             }
             
             await new Promise(r => setTimeout(r, 65));
         }
         
-        console.log(`🎉 [${guild.name}] COMPLETE: ${kicked}/${queue.length} kicked`);
+        console.log(`✅ [${guild.name}] ${kicked} kicked`);
         
     } catch (e) {
-        console.error(`❌ Mass kick error:`, e.message);
+        console.error('Mass kick error:', e.message);
     } finally {
         processingGuilds.delete(guildId);
         rateLimits.delete(guildId);
     }
 }
 
-function canKick(guildId) {
-    const now = Date.now();
-    const guildData = rateLimits.get(guildId);
-    return !guildData || now >= guildData.nextKick;
+async function logAction(guild, member, reason) {
+    try {
+        if (config.logChannelId && guild) {
+            const channel = guild.channels.cache.get(config.logChannelId);
+            if (channel && member) {
+                await channel.send({
+                    embeds: [{
+                        title: '🚨 KICK',
+                        description: `${member.user.tag} (${member.id})\n${reason}`,
+                        color: 0xffaa00
+                    }]
+                }).catch(() => {});
+            }
+        }
+    } catch (e) {}
 }
 
-// 🔥 JOIN EVENT - SMART PROTECTION
+// 🔥 EVENTS
 client.on('guildMemberAdd', async (member) => {
     if (!antiNukeEnabled) return;
     
-    // Track join time
     recentJoins.set(member.id, Date.now());
-    
-    // Clean up old joins (keep last 60s)
     setTimeout(() => recentJoins.delete(member.id), 60000);
     
     console.log(`👤 [${member.guild.name}] ${member.user.tag} joined`);
     
-    // IMMEDIATE CHECK: Selfbot/alt spam (multiple joins in 3s)
+    // Spam detection (>3 joins in 3s)
     const now = Date.now();
-    const recentJoinCount = Array.from(recentJoins.values())
-        .filter(time => now - time < 3000).length;
+    const recentCount = Array.from(recentJoins.values()).filter(t => now - t < 3000).length;
     
-    if (recentJoinCount > 3) {
-        console.log(`🚨 [${member.guild.name}] Join spam detected (${recentJoinCount}/3s)`);
-        setTimeout(() => {
-            if (!isWhitelisted(member) && member.guild?.members.cache.get(member.id)) {
-                member.kick('Anti-nuke: Join spam');
-                console.log(`🚨 Kicked spammer: ${member.user.tag}`);
+    if (recentCount > 3 && !isWhitelisted(member)) {
+        console.log(`🚨 Join spam: ${recentCount}/3s`);
+        setTimeout(async () => {
+            if (member.guild?.members.cache.get(member.id) && !isWhitelisted(member)) {
+                await member.kick('Anti-nuke: Join spam');
             }
         }, 2000);
-        return;
+    } else {
+        console.log(`⏳ ${member.user.tag} (10s safe)`);
     }
-    
-    // SAFE: Legit users get 10s grace period
-    console.log(`⏳ [${member.guild.name}] ${member.user.tag} (10s grace)`);
 });
 
-// 🔥 OTHER EVENTS (unchanged)
 client.on('channelCreate', async (channel) => {
     if (!antiNukeEnabled) return;
     const guild = channel.guild;
     if (trustedUsers.has(guild.ownerId)) return;
     console.log(`🚨 [${guild.name}] Channel: ${channel.name}`);
-    setTimeout(() => massKick(guild, 'Channel creation'), 800);
+    setTimeout(() => massKick(guild, 'Channel create'), 800);
+    setTimeout(() => channel.delete('Anti-nuke').catch(() => {}), 300);
 });
 
 client.on('roleCreate', async (role) => {
@@ -163,13 +175,12 @@ client.on('roleCreate', async (role) => {
     const guild = role.guild;
     if (trustedUsers.has(guild.ownerId)) return;
     console.log(`🚨 [${guild.name}] Role: ${role.name}`);
-    setTimeout(() => massKick(guild, 'Role creation'), 800);
+    setTimeout(() => massKick(guild, 'Role create'), 800);
 });
 
-// [Rest of events unchanged - channelUpdate, webhookCreate, etc...]
-client.on('channelUpdate', async (oldChannel, newChannel) => {
-    if (oldChannel.name === newChannel.name || !antiNukeEnabled) return;
-    const guild = newChannel.guild;
+client.on('channelUpdate', async (old, neu) => {
+    if (old.name === neu.name || !antiNukeEnabled) return;
+    const guild = neu.guild;
     if (trustedUsers.has(guild.ownerId)) return;
     setTimeout(() => massKick(guild, 'Channel rename'), 800);
 });
@@ -179,7 +190,6 @@ client.on('webhookCreate', async (webhook) => {
     const guild = webhook.guild;
     if (trustedUsers.has(guild.ownerId)) return;
     setTimeout(() => massKick(guild, 'Webhook'), 800);
-    setTimeout(() => webhook.delete('Anti-nuke').catch(() => {}), 300);
 });
 
 client.on('guildIntegrationsUpdate', async (guild) => {
@@ -187,22 +197,22 @@ client.on('guildIntegrationsUpdate', async (guild) => {
     setTimeout(() => massKick(guild, 'Integration'), 800);
 });
 
-client.on('roleUpdate', async (oldRole, newRole) => {
-    if (oldRole.name === newRole.name && oldRole.permissions.bitfield === newRole.permissions.bitfield || !antiNukeEnabled) return;
-    const guild = newRole.guild;
+client.on('roleUpdate', async (old, neu) => {
+    if (old.name === neu.name && old.permissions.bitfield === neu.permissions.bitfield || !antiNukeEnabled) return;
+    const guild = neu.guild;
     if (trustedUsers.has(guild.ownerId)) return;
     setTimeout(() => massKick(guild, 'Role edit'), 800);
 });
 
-client.on('guildUpdate', async (oldGuild, newGuild) => {
-    if (!antiNukeEnabled || trustedUsers.has(newGuild.ownerId)) return;
+client.on('guildUpdate', async (old, neu) => {
+    if (!antiNukeEnabled || trustedUsers.has(neu.ownerId)) return;
     const changes = [];
-    if (oldGuild.name !== newGuild.name) changes.push('NAME');
-    if (oldGuild.icon !== newGuild.icon) changes.push('ICON');
-    if (changes.length) setTimeout(() => massKick(newGuild, `Server ${changes.join('&')}`), 800);
+    if (old.name !== neu.name) changes.push('NAME');
+    if (old.icon !== neu.icon) changes.push('ICON');
+    if (changes.length) setTimeout(() => massKick(neu, `Server ${changes.join('&')}`), 800);
 });
 
-// 📊 SLASH COMMANDS (unchanged)
+// ⚔️ SLASH COMMANDS
 client.on('interactionCreate', async (interaction) => {
     if (!interaction.isChatInputCommand()) return;
     
@@ -211,7 +221,7 @@ client.on('interactionCreate', async (interaction) => {
         
         if (commandName === 'antinode') {
             antiNukeEnabled = !antiNukeEnabled;
-            await interaction.reply({ content: `🛡️ v4.2: **${antiNukeEnabled ? '🟢 ON' : '🔴 OFF'}**`, ephemeral: true });
+            await interaction.reply({ content: `🛡️ **${antiNukeEnabled ? '🟢 ON' : '🔴 OFF'}**`, ephemeral: true });
         }
         
         if (commandName === 'add-trust') {
@@ -220,49 +230,53 @@ client.on('interactionCreate', async (interaction) => {
             await interaction.reply({ content: `✅ ${user.tag} trusted`, ephemeral: true });
         }
         
+        if (commandName === 'remove-trust') {
+            const user = interaction.options.getUser('user');
+            trustedUsers.delete(user.id);
+            await interaction.reply({ content: `❌ ${user.tag} untrusted`, ephemeral: true });
+        }
+        
+        if (commandName === 'add-role') {
+            const role = interaction.options.getRole('role');
+            whitelistRolesSet.add(role.id);
+            await interaction.reply({ content: `✅ ${role.name} whitelisted`, ephemeral: true });
+        }
+        
         if (commandName === 'status') {
             const embed = new EmbedBuilder()
                 .setTitle('🛡️ Anti-Nuke v4.2')
                 .addFields(
-                    { name: 'Status', value: antiNukeEnabled ? '🟢 ACTIVE' : '🔴 PAUSED', inline: true },
+                    { name: 'Status', value: antiNukeEnabled ? '🟢 ACTIVE' : '🔴 OFF', inline: true },
                     { name: 'Trusted', value: `${trustedUsers.size}`, inline: true },
-                    { name: 'Grace Period', value: '10s safe joins ✅', inline: true }
+                    { name: 'Roles', value: `${whitelistRolesSet.size}`, inline: true },
+                    { name: 'Servers', value: `${client.guilds.cache.size}`, inline: true },
+                    { name: 'Join Grace', value: '10s ✅', inline: true }
                 )
-                .setColor(antiNukeEnabled ? 0x00ff88 : 0xff4444);
+                .setColor(antiNukeEnabled ? 0x00ff88 : 0xff4444)
+                .setTimestamp();
             await interaction.reply({ embeds: [embed] });
         }
         
         if (commandName === 'masskick') {
-            await interaction.reply({ content: '💥 Emergency kick started...', ephemeral: true });
+            await interaction.reply({ content: '💥 Emergency kick...', ephemeral: true });
             massKick(interaction.guild, 'Emergency');
         }
         
-    } catch(e) {
-        await interaction.reply({ content: '❌ Error', ephemeral: true }).catch(() => {});
+    } catch (e) {
+        console.error(e);
     }
 });
 
-async function logAction(guild, member, reason) {
-    try {
-        if (config.logChannelId) {
-            const channel = guild.channels.cache.get(config.logChannelId);
-            if (channel) {
-                await channel.send({ 
-                    embeds: [{
-                        title: '🚨 KICK',
-                        description: `${member.user.tag}\n${reason}`,
-                        color: 0xffaa00
-                    }]
-                });
-            }
-        }
-    } catch(e) {}
-}
-
-// 🚀 START
+// 🚀 READY
 client.once('ready', () => {
-    console.log(`\n✅ Anti-Nuke v4.2 LIVE | Smart joins + Rate limits fixed`);
-    client.user.setActivity(`🛡️ ${client.guilds.cache.size} servers`, { type: ActivityType.Watching });
+    console.log(`\n✅ Anti-Nuke v4.2 LIVE | ${client.guilds.cache.size} servers`);
+    console.log(`🟢 Trusted: ${trustedUsers.size}`);
+    
+    const statuses = ['🛡️ Servers protected', `👥 ${trustedUsers.size} trusted`, '⚔️ v4.2 rate-proof'];
+    let i = 0;
+    setInterval(() => {
+        client.user.setActivity(statuses[i++ % statuses.length], { type: ActivityType.Watching });
+    }, 10000);
 });
 
 client.login(config.token);
