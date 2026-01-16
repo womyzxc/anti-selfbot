@@ -15,7 +15,7 @@ let antiNukeEnabled = true;
 let trustedUsers = new Set(config.trustedIds);
 let whitelistRolesSet = new Set(config.whitelistRoles);
 
-console.log('🤖 Anti-Nuke v4.3 starting...');
+console.log('🤖 Anti-Nuke v4.4 starting...');
 
 const client = new Client({
     intents: [
@@ -38,8 +38,18 @@ function isWhitelisted(member) {
            Array.from(whitelistRolesSet).some(roleId => member.roles.cache.has(roleId));
 }
 
-function isGuildOwnerProtected(guild) {
-    return trustedUsers.has(guild.ownerId);
+async function getAuditLogAuthor(guild, actionType) {
+    try {
+        const auditLogs = await guild.fetchAuditLogs({ type: actionType, limit: 1 });
+        const entry = auditLogs.entries.first();
+        if (entry) {
+            const member = guild.members.cache.get(entry.executor.id);
+            return member ? isWhitelisted(member) : false;
+        }
+    } catch (e) {
+        console.log('⚠️ Audit log check failed');
+    }
+    return false;
 }
 
 function canKick(guildId) {
@@ -54,7 +64,7 @@ const processingGuilds = new Set();
 
 async function massKick(guild, reason) {
     const guildId = guild.id;
-    if (!antiNukeEnabled || isGuildOwnerProtected(guild) || processingGuilds.has(guildId)) {
+    if (!antiNukeEnabled || processingGuilds.has(guildId)) {
         return;
     }
     
@@ -127,18 +137,23 @@ async function logAction(guild, member, reason) {
     } catch (e) {}
 }
 
-// 🔥 EVENTS - Join punishment completely removed
+// 🔥 EVENTS - Now checks audit logs for whitelisted authors
 client.on('guildMemberAdd', async (member) => {
     if (!antiNukeEnabled) return;
-    
     console.log(`👤 [${member.guild.name}] ${member.user.tag} joined`);
-    console.log(`⏳ ${member.user.tag} monitored`);
 });
 
 client.on('channelCreate', async (channel) => {
     if (!antiNukeEnabled) return;
     const guild = channel.guild;
-    if (isGuildOwnerProtected(guild)) return;
+    
+    // Check if creator is whitelisted via audit log
+    const creatorWhitelisted = await getAuditLogAuthor(guild, 'CHANNEL_CREATE');
+    if (creatorWhitelisted) {
+        console.log(`✅ [${guild.name}] Channel created by whitelisted user`);
+        return;
+    }
+    
     console.log(`🚨 [${guild.name}] Channel: ${channel.name}`);
     setTimeout(() => massKick(guild, 'Channel create'), 800);
     setTimeout(() => channel.delete('Anti-nuke').catch(() => {}), 300);
@@ -147,52 +162,89 @@ client.on('channelCreate', async (channel) => {
 client.on('roleCreate', async (role) => {
     if (!antiNukeEnabled) return;
     const guild = role.guild;
-    if (isGuildOwnerProtected(guild)) return;
+    
+    const creatorWhitelisted = await getAuditLogAuthor(guild, 'ROLE_CREATE');
+    if (creatorWhitelisted) {
+        console.log(`✅ [${guild.name}] Role created by whitelisted user`);
+        return;
+    }
+    
     console.log(`🚨 [${guild.name}] Role: ${role.name}`);
     setTimeout(() => massKick(guild, 'Role create'), 800);
 });
 
-client.on('channelUpdate', async (old, neu) => {
-    if (old.name === neu.name || !antiNukeEnabled) return;
-    const guild = neu.guild;
-    if (isGuildOwnerProtected(guild)) return;
+client.on('channelUpdate', async (oldChannel, newChannel) => {
+    if (oldChannel.name === newChannel.name || !antiNukeEnabled) return;
+    const guild = newChannel.guild;
+    
+    const renamerWhitelisted = await getAuditLogAuthor(guild, 'CHANNEL_UPDATE');
+    if (renamerWhitelisted) {
+        console.log(`✅ [${guild.name}] Channel renamed by whitelisted user`);
+        return;
+    }
+    
+    console.log(`🚨 [${guild.name}] Channel renamed: ${newChannel.name}`);
     setTimeout(() => massKick(guild, 'Channel rename'), 800);
 });
 
 client.on('webhookCreate', async (webhook) => {
     if (!antiNukeEnabled) return;
     const guild = webhook.guild;
-    if (isGuildOwnerProtected(guild)) return;
+    
+    const creatorWhitelisted = await getAuditLogAuthor(guild, 'WEBHOOK_CREATE');
+    if (creatorWhitelisted) {
+        console.log(`✅ [${guild.name}] Webhook created by whitelisted user`);
+        return;
+    }
+    
     setTimeout(() => massKick(guild, 'Webhook'), 800);
 });
 
 client.on('guildIntegrationsUpdate', async (guild) => {
-    if (!antiNukeEnabled || isGuildOwnerProtected(guild)) return;
+    if (!antiNukeEnabled) return;
+    const creatorWhitelisted = await getAuditLogAuthor(guild, 'INTEGRATION_CREATE');
+    if (creatorWhitelisted) {
+        console.log(`✅ [${guild.name}] Integration by whitelisted user`);
+        return;
+    }
     setTimeout(() => massKick(guild, 'Integration'), 800);
 });
 
-client.on('roleUpdate', async (old, neu) => {
-    if (old.name === neu.name && old.permissions.bitfield === neu.permissions.bitfield || !antiNukeEnabled) return;
-    const guild = neu.guild;
-    if (isGuildOwnerProtected(guild)) return;
+client.on('roleUpdate', async (oldRole, newRole) => {
+    if (oldRole.name === newRole.name && oldRole.permissions.bitfield === newRole.permissions.bitfield || !antiNukeEnabled) return;
+    const guild = newRole.guild;
+    
+    const editorWhitelisted = await getAuditLogAuthor(guild, 'ROLE_UPDATE');
+    if (editorWhitelisted) {
+        console.log(`✅ [${guild.name}] Role edited by whitelisted user`);
+        return;
+    }
+    
     setTimeout(() => massKick(guild, 'Role edit'), 800);
 });
 
-client.on('guildUpdate', async (old, neu) => {
-    if (!antiNukeEnabled || isGuildOwnerProtected(neu)) return;
+client.on('guildUpdate', async (oldGuild, newGuild) => {
+    if (!antiNukeEnabled) return;
     const changes = [];
-    if (old.name !== neu.name) changes.push('NAME');
-    if (old.icon !== neu.icon) changes.push('ICON');
-    if (changes.length) setTimeout(() => massKick(neu, `Server ${changes.join('&')}`), 800);
+    if (oldGuild.name !== newGuild.name) changes.push('NAME');
+    if (oldGuild.icon !== newGuild.icon) changes.push('ICON');
+    if (changes.length) {
+        const updaterWhitelisted = await getAuditLogAuthor(newGuild, 'GUILD_UPDATE');
+        if (updaterWhitelisted) {
+            console.log(`✅ [${newGuild.name}] Guild updated by whitelisted user`);
+            return;
+        }
+        setTimeout(() => massKick(newGuild, `Server ${changes.join('&')}`), 800);
+    }
 });
 
-// ⚔️ SLASH COMMANDS
+// ⚔️ SLASH COMMANDS - Fixed with proper registration
 client.on('interactionCreate', async (interaction) => {
     if (!interaction.isChatInputCommand()) return;
     
+    const { commandName } = interaction;
+    
     try {
-        const { commandName } = interaction;
-        
         if (commandName === 'antinode') {
             antiNukeEnabled = !antiNukeEnabled;
             await interaction.reply({ content: `🛡️ **${antiNukeEnabled ? '🟢 ON' : '🔴 OFF'}**`, ephemeral: true });
@@ -218,13 +270,13 @@ client.on('interactionCreate', async (interaction) => {
         
         if (commandName === 'status') {
             const embed = new EmbedBuilder()
-                .setTitle('🛡️ Anti-Nuke v4.3')
+                .setTitle('🛡️ Anti-Nuke v4.4')
                 .addFields(
                     { name: 'Status', value: antiNukeEnabled ? '🟢 ACTIVE' : '🔴 OFF', inline: true },
                     { name: 'Trusted', value: `${trustedUsers.size}`, inline: true },
                     { name: 'Roles', value: `${whitelistRolesSet.size}`, inline: true },
                     { name: 'Servers', value: `${client.guilds.cache.size}`, inline: true },
-                    { name: 'Protection', value: 'Owner+Roles ✅', inline: true }
+                    { name: 'Audit Logs', value: '✅ ACTIVE', inline: true }
                 )
                 .setColor(antiNukeEnabled ? 0x00ff88 : 0xff4444)
                 .setTimestamp();
@@ -237,16 +289,71 @@ client.on('interactionCreate', async (interaction) => {
         }
         
     } catch (e) {
-        console.error(e);
+        console.error('Command error:', e);
+        await interaction.reply({ content: '❌ Command failed', ephemeral: true }).catch(() => {});
     }
 });
 
-// 🚀 READY
-client.once('ready', () => {
-    console.log(`\n✅ Anti-Nuke v4.3 LIVE | ${client.guilds.cache.size} servers`);
+// 🚀 READY + Command Registration
+client.once('ready', async () => {
+    console.log(`\n✅ Anti-Nuke v4.4 LIVE | ${client.guilds.cache.size} servers`);
     console.log(`🟢 Trusted: ${trustedUsers.size}`);
     
-    const statuses = ['🛡️ Servers protected', `👥 ${trustedUsers.size} trusted`, '⚔️ v4.3 owner-safe'];
+    // Register slash commands globally
+    try {
+        const commands = [
+            {
+                name: 'antinode',
+                description: 'Toggle anti-nuke ON/OFF'
+            },
+            {
+                name: 'add-trust',
+                description: 'Add trusted user',
+                options: [{
+                    name: 'user',
+                    type: 6, // USER
+                    description: 'User to trust',
+                    required: true
+                }]
+            },
+            {
+                name: 'remove-trust',
+                description: 'Remove trusted user',
+                options: [{
+                    name: 'user',
+                    type: 6, // USER
+                    description: 'User to untrust',
+                    required: true
+                }]
+            },
+            {
+                name: 'add-role',
+                description: 'Add whitelist role',
+                options: [{
+                    name: 'role',
+                    type: 8, // ROLE
+                    description: 'Role to whitelist',
+                    required: true
+                }]
+            },
+            {
+                name: 'status',
+                description: 'Show bot status'
+            },
+            {
+                name: 'masskick',
+                description: 'Emergency mass kick (use carefully!)'
+            }
+        ];
+
+        console.log('🔄 Registering slash commands...');
+        await client.application.commands.set(commands);
+        console.log('✅ Slash commands registered!');
+    } catch (e) {
+        console.error('Command registration failed:', e);
+    }
+    
+    const statuses = ['🛡️ Servers protected', `👥 ${trustedUsers.size} trusted`, '⚔️ v4.4 audit-safe'];
     let i = 0;
     setInterval(() => {
         client.user.setActivity(statuses[i++ % statuses.length], { type: ActivityType.Watching });
