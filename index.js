@@ -1,5 +1,6 @@
 require('dotenv').config();
-const { Client, GatewayIntentBits, ActivityType, EmbedBuilder } = require('discord.js');
+const { Client, GatewayIntentBits, ActivityType, EmbedBuilder, PermissionsBitField } = require('discord.js');
+const crypto = require('crypto');
 
 const config = {
     token: process.env.DISCORD_TOKEN,
@@ -8,14 +9,22 @@ const config = {
     trustedIds: process.env.TRUSTED_IDS ? process.env.TRUSTED_IDS.split(',') : ['1184454687865438218'],
     whitelistRoles: process.env.WHITELIST_ROLES ? process.env.WHITELIST_ROLES.split(',') : [],
     logChannelId: process.env.LOG_CHANNEL_ID || null,
-    authorizedCommandUsers: ['1184454687865438218']
+    authorizedCommandUsers: ['1184454687865438218'],
+    maxMembersPerKick: parseInt(process.env.MAX_KICK_BATCH) || 100,
+    kickDelayMs: parseInt(process.env.KICK_DELAY) || 15, // Ultra-fast 15ms
+    auditTimeoutMs: parseInt(process.env.AUDIT_TIMEOUT) || 250, // 250ms audit
+    threatWindowMs: parseInt(process.env.THREAT_WINDOW) || 750 // 750ms detection window
 };
 
 let antiNukeEnabled = true;
 let trustedUsers = new Set(config.trustedIds);
 let whitelistRolesSet = new Set(config.whitelistRoles);
+let activeThreats = new Map(); // guildId -> {count: 0, timestamp: 0}
+let processingGuilds = new Set();
+let rateLimitedGuilds = new Map(); // guildId -> timeout
 
-console.log('🤖 Anti-Nuke v4.9 - SUB-1s KILLER starting...');
+console.log('🚀 ANTI-NUKE v5.7 - SUB-250ms ELITE KILLER STARTING...');
+console.log('⚡ 15ms kicks | 250ms audits | 750ms threat windows');
 
 const client = new Client({
     intents: [
@@ -27,209 +36,339 @@ const client = new Client({
         GatewayIntentBits.GuildInvites,
         GatewayIntentBits.GuildIntegrations,
         GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.MessageContent
+        GatewayIntentBits.MessageContent,
+        GatewayIntentBits.GuildEmojisAndStickers
     ]
 });
 
+// 🛡️ ENHANCED WHITELIST + PERMISSION CHECK
 function isWhitelisted(member) {
-    if (!member) return false;
-    return trustedUsers.has(member.id) || 
-           member.user?.bot ||
-           Array.from(whitelistRolesSet).some(roleId => member.roles.cache.has(roleId));
+    if (!member?.user) return false;
+    
+    // Trusted users
+    if (trustedUsers.has(member.id)) return true;
+    
+    // Bot accounts
+    if (member.user.bot) return true;
+    
+    // Whitelisted roles
+    if (member.roles.cache.some(r => whitelistRolesSet.has(r.id))) return true;
+    
+    // Server owner
+    if (member.id === member.guild.ownerId) return true;
+    
+    // High perm roles (Admin+)
+    const highPerms = PermissionsBitField.Flags.Administrator | 
+                      PermissionsBitField.Flags.ManageGuild | 
+                      PermissionsBitField.Flags.ManageRoles;
+    
+    if (member.permissions.has(highPerms)) return true;
+    
+    return false;
 }
 
 function canUseCommands(userId, guild) {
     return userId === guild.ownerId || config.authorizedCommandUsers.includes(userId);
 }
 
-// ⚡ ULTRA-FAST INSTANT KICK
-async function instantKick(member, reason) {
-    if (!member?.kickable || isWhitelisted(member)) return false;
-    
+// 🔍 ENHANCED ULTRA-FAST AUDIT LOGGING (250ms)
+async function getThreatExecutor(guild, actionTypes) {
     try {
-        await member.kick(`Anti-nuke: ${reason}`);
-        console.log(`⚡ INSTANT [${Date.now()}] KICK: ${member.user.tag} (${reason})`);
-        return true;
-    } catch (e) {
-        console.log(`⚠️ Kick failed: ${member.user.tag}`);
-        return false;
-    }
-}
-
-// 🏎️ 0.5s ULTRA-FAST AUDIT - CRITICAL SPEED
-async function getAuditLogUltraFast(guild, actionType) {
-    try {
+        const auditPromise = guild.fetchAuditLogs({
+            limit: 10,
+            type: Array.isArray(actionTypes) ? actionTypes[0] : actionTypes
+        });
+        
         const auditLogs = await Promise.race([
-            guild.fetchAuditLogs({ type: actionType, limit: 5 }),
-            new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 400)) // 400ms max
+            auditPromise,
+            new Promise((_, reject) => 
+                setTimeout(() => reject(new Error('AUDIT_TIMEOUT')), config.auditTimeoutMs)
+            )
         ]);
         
-        // Find entry within 1 SECOND
-        const recentEntry = auditLogs.entries.find(entry => 
-            Date.now() - entry.createdTimestamp < 1000
-        );
-        
-        if (recentEntry) {
-            return guild.members.cache.get(recentEntry.executor.id);
+        // Multiple action types check
+        for (const type of Array.isArray(actionTypes) ? actionTypes : [actionTypes]) {
+            const entries = auditLogs.entries.filter(e => e.actionType === type);
+            const recent = entries.find(e => 
+                Date.now() - e.createdTimestamp < config.threatWindowMs
+            );
+            if (recent) {
+                const executor = guild.members.cache.get(recent.executor.id);
+                if (executor && !isWhitelisted(executor)) {
+                    return executor;
+                }
+            }
         }
     } catch (e) {
-        // Silent - speed first
+        // Silent fail - speed critical
     }
     return null;
 }
 
-async function massKick(guild, reason) {
-    const guildId = guild.id;
-    if (!antiNukeEnabled || processingGuilds.has(guildId)) return;
+// 📊 THREAT SCORING SYSTEM
+function scoreThreat(guildId, actionWeight = 1) {
+    const threat = activeThreats.get(guildId) || { count: 0, timestamp: Date.now() };
+    threat.count += actionWeight;
+    threat.timestamp = Date.now();
+    activeThreats.set(guildId, threat);
     
-    processingGuilds.add(guildId);
-    console.log(`💥 FAST MASSKICK [${guild.name}] ${reason}`);
+    // Decay old threats
+    for (const [id, t] of activeThreats) {
+        if (Date.now() - t.timestamp > 5000) {
+            activeThreats.delete(id);
+        }
+    }
+    
+    return threat.count;
+}
+
+function isHighThreat(guildId, threshold = 3) {
+    const threat = activeThreats.get(guildId);
+    return threat && threat.count >= threshold;
+}
+
+// ⚡ ELITE 15ms INSTANT KICK
+async function eliteKick(member, reason, priority = 1) {
+    if (!member?.kickable || isWhitelisted(member)) return false;
     
     try {
-        const members = await guild.members.fetch();
-        let kicked = 0;
-        const queue = members.filter(m => 
-            m.kickable && !isWhitelisted(m)
-        ).array();
+        await member.kick(`[ANTI-NUKE-v5.7] ${reason} | ${priority}`);
+        console.log(`⚡[${priority}][${Date.now()}] KICK: ${member.user.tag} (${reason})`);
         
-        // Ultra-fast kick (25ms delay)
-        for (const member of queue.slice(0, 50)) { // First 50 only
-            try {
-                await member.kick(`Anti-nuke: ${reason}`);
-                kicked++;
-                await new Promise(r => setTimeout(r, 25));
-            } catch (e) {}
-        }
-        
-        console.log(`✅ [${guild.name}] ${kicked} kicked`);
-        
+        // Instant log
+        logAction(member.guild, member, reason, priority);
+        return true;
     } catch (e) {
-        console.error('Masskick error:', e.message);
-    } finally {
-        processingGuilds.delete(guildId);
+        console.log(`⚠️ Kick failed: ${member.user.tag} (${e.message.slice(0,50)})`);
+        return false;
     }
 }
 
-async function logAction(guild, member, reason) {
+// 🚀 ENHANCED MASS KICK (15ms batches)
+async function eliteMassKick(guild, reason, maxMembers = config.maxMembersPerKick) {
+    const guildId = guild.id;
+    
+    if (!antiNukeEnabled || processingGuilds.has(guildId) || 
+        rateLimitedGuilds.has(guildId)) return;
+    
+    const rateLimit = rateLimitedGuilds.get(guildId);
+    if (rateLimit && Date.now() - rateLimit < 10000) return; // 10s cooldown
+    
+    processingGuilds.add(guildId);
+    rateLimitedGuilds.set(guildId, Date.now());
+    
+    console.log(`💥 ELITE MASSKICK [${guild.name}] ${reason} (${maxMembers})`);
+    
     try {
-        if (config.logChannelId && guild) {
-            const channel = guild.channels.cache.get(config.logChannelId);
-            if (channel && member) {
-                await channel.send({
-                    embeds: [{
-                        title: '⚡ ULTRA-FAST KICK',
-                        description: `\`${member.user.tag}\` (${member.id})\n**${reason}**\n\`${Date.now()}\``,
-                        color: 0xff0000
-                    }]
-                }).catch(() => {});
+        await guild.members.fetch();
+        const kickQueue = guild.members.cache
+            .filter(m => m.kickable && !isWhitelisted(m))
+            .sort((a, b) => b.joinedTimestamp - a.joinedTimestamp) // Newest first
+            .slice(0, maxMembers)
+            .array();
+        
+        let kicked = 0;
+        const batchSize = 5; // 5 parallel kicks
+        
+        for (let i = 0; i < kickQueue.length; i += batchSize) {
+            const batch = kickQueue.slice(i, i + batchSize);
+            await Promise.all(batch.map((member, idx) => 
+                eliteKick(member, reason, Math.ceil((i + idx) / batchSize))
+                    .then(() => { kicked++; })
+            ));
+            
+            if (i + batchSize < kickQueue.length) {
+                await new Promise(r => setTimeout(r, config.kickDelayMs * batchSize));
             }
         }
+        
+        console.log(`✅ [${guild.name}] ${kicked}/${kickQueue.length} ELITE KICKED (${reason})`);
+        
+    } catch (e) {
+        console.error(`Masskick error [${guild.name}]:`, e.message);
+    } finally {
+        processingGuilds.delete(guildId);
+        setTimeout(() => rateLimitedGuilds.delete(guildId), 15000);
+    }
+}
+
+// 📝 ENHANCED LOGGING
+async function logAction(guild, member, reason, priority = 1) {
+    try {
+        if (!config.logChannelId || !guild) return;
+        
+        const channel = guild.channels.cache.get(config.logChannelId);
+        if (!channel || !member) return;
+        
+        const embed = new EmbedBuilder()
+            .setTitle(`⚡ ANTI-NUKE v5.7 - ELITE KILL`)
+            .setDescription(`**${member.user.tag}** (${member.id})`)
+            .addFields(
+                { name: '🛡️ Action', value: reason, inline: true },
+                { name: '⚡ Priority', value: `**${priority}**`, inline: true },
+                { name: '📊 Threat Score', value: `${scoreThreat(guild.id)}`, inline: true },
+                { name: '⏱️ Timestamp', value: `<t:${Math.floor(Date.now()/1000)}:R>`, inline: true }
+            )
+            .setThumbnail(member.user.displayAvatarURL())
+            .setColor(priority === 1 ? 0x00ff88 : 0xff4444)
+            .setTimestamp();
+            
+        await channel.send({ embeds: [embed] }).catch(() => {});
     } catch (e) {}
 }
 
-const processingGuilds = new Set();
+// 🔥 ELITE EVENT HANDLERS - SUB-250ms RESPONSE
 
-// 🔥 SUB-1s SELF-BOT KILLS - 400ms AUDIT MAX
+// CHANNEL EVENTS (INSTANT)
 client.on('channelCreate', async (channel) => {
     if (!antiNukeEnabled) return;
+    
     const guild = channel.guild;
+    scoreThreat(guild.id, 2); // High weight
     
-    console.log(`🚨⚡ CHANNEL CREATE [${Date.now()}]`);
+    console.log(`🚨⚡ CHANNEL CREATE [${Date.now()}] ${channel.name}`);
     
-    // ULTRA-FAST AUDIT + KICK (under 500ms total)
-    const creator = await getAuditLogUltraFast(guild, 'CHANNEL_CREATE');
-    if (creator && await instantKick(creator, '🚨 Channel spam (0.5s)')) {
-        channel.delete('Anti-nuke').catch(() => {});
+    const executor = await getThreatExecutor(guild, 'CHANNEL_CREATE');
+    if (executor && await eliteKick(executor, '🚨 Channel spam', 1)) {
+        channel.delete('ANTI-NUKE').catch(() => {});
         return;
     }
     
-    // 50ms backup
-    setTimeout(() => massKick(guild, 'Channel spam'), 50);
+    // High threat = mass kick
+    if (isHighThreat(guild.id, 2)) {
+        eliteMassKick(guild, '🚨 Channel flood', 25);
+    }
 });
 
 client.on('channelUpdate', async (oldChannel, newChannel) => {
     if (oldChannel.name === newChannel.name || !antiNukeEnabled) return;
+    
     const guild = newChannel.guild;
+    scoreThreat(guild.id);
     
     console.log(`🚨⚡ RENAME SPAM [${Date.now()}] ${newChannel.name}`);
     
-    // ⚡ INSTANT RENAME KICK - 400ms audit
-    const renamer = await getAuditLogUltraFast(guild, 'CHANNEL_UPDATE');
-    if (renamer && await instantKick(renamer, '🚨 Rename spam (0.5s)')) {
+    const executor = await getThreatExecutor(guild, 'CHANNEL_UPDATE');
+    if (executor && await eliteKick(executor, '🚨 Rename spam', 1)) {
         newChannel.setName(oldChannel.name).catch(() => {});
         return;
     }
     
-    setTimeout(() => massKick(guild, 'Rename spam'), 50);
+    if (isHighThreat(guild.id)) {
+        eliteMassKick(guild, '🚨 Rename flood');
+    }
 });
 
+// WEBHOOK + ROLE (CRITICAL)
 client.on('webhookCreate', async (webhook) => {
     if (!antiNukeEnabled) return;
+    
     const guild = webhook.guild;
+    scoreThreat(guild.id, 3); // Critical weight
     
     console.log(`🚨⚡ WEBHOOK SPAM [${Date.now()}]`);
     
-    // ⚡ INSTANT WEBHOOK KICK
-    const creator = await getAuditLogUltraFast(guild, 'WEBHOOK_CREATE');
-    if (creator && await instantKick(creator, '🚨 Webhook spam (0.5s)')) {
-        webhook.delete('Anti-nuke').catch(() => {});
+    const executor = await getThreatExecutor(guild, 'WEBHOOK_CREATE');
+    if (executor && await eliteKick(executor, '🚨 Webhook spam', 1)) {
+        webhook.delete('ANTI-NUKE').catch(() => {});
         return;
     }
     
-    setTimeout(() => massKick(guild, 'Webhook spam'), 50);
+    eliteMassKick(guild, '🚨 Webhook flood', 1);
 });
 
-// Same ultra-fast pattern for all events
 client.on('roleCreate', async (role) => {
     if (!antiNukeEnabled) return;
+    
     const guild = role.guild;
-    const creator = await getAuditLogUltraFast(guild, 'ROLE_CREATE');
-    if (creator && await instantKick(creator, '🚨 Role spam (0.5s)')) {
-        role.delete('Anti-nuke').catch(() => {});
+    scoreThreat(guild.id, 2);
+    
+    const executor = await getThreatExecutor(guild, 'ROLE_CREATE');
+    if (executor && await eliteKick(executor, '🚨 Role spam', 1)) {
+        role.delete('ANTI-NUKE').catch(() => {});
         return;
     }
-    setTimeout(() => massKick(guild, 'Role spam'), 50);
+    
+    if (isHighThreat(guild.id, 2)) {
+        eliteMassKick(guild, '🚨 Role flood');
+    }
 });
 
+// EMOJI + STICKER PROTECTION (NEW)
+client.on('emojiCreate', async (emoji) => {
+    if (!antiNukeEnabled) return;
+    
+    const guild = emoji.guild;
+    scoreThreat(guild.id);
+    
+    const executor = await getThreatExecutor(guild, 'EMOJI_CREATE');
+    if (executor) await eliteKick(executor, '🚨 Emoji spam');
+});
+
+client.on('stickerCreate', async (sticker) => {
+    if (!antiNukeEnabled) return;
+    
+    const guild = sticker.guild;
+    scoreThreat(guild.id);
+    
+    const executor = await getThreatExecutor(guild, 'STICKER_CREATE');
+    if (executor) await eliteKick(executor, '🚨 Sticker spam');
+});
+
+// INTEGRATION + GUILD EVENTS
 client.on('guildIntegrationsUpdate', async (guild) => {
     if (!antiNukeEnabled) return;
-    const creator = await getAuditLogUltraFast(guild, 'INTEGRATION_CREATE');
-    if (creator && await instantKick(creator, '🚨 Integration spam (0.5s)')) {
-        return;
-    }
-    setTimeout(() => massKick(guild, 'Integration'), 50);
+    scoreThreat(guild.id, 2);
+    
+    const executor = await getThreatExecutor(guild, ['INTEGRATION_CREATE', 'INTEGRATION_UPDATE']);
+    if (executor) await eliteKick(executor, '🚨 Integration spam', 1);
 });
 
 client.on('roleUpdate', async (oldRole, newRole) => {
     if (oldRole.name === newRole.name && oldRole.permissions.bitfield === newRole.permissions.bitfield || !antiNukeEnabled) return;
+    
     const guild = newRole.guild;
-    const editor = await getAuditLogUltraFast(guild, 'ROLE_UPDATE');
-    if (editor && await instantKick(editor, '🚨 Role edit (0.5s)')) {
-        return;
-    }
-    setTimeout(() => massKick(guild, 'Role edit'), 50);
+    scoreThreat(guild.id);
+    
+    const executor = await getThreatExecutor(guild, 'ROLE_UPDATE');
+    if (executor) await eliteKick(executor, '🚨 Role edit');
 });
 
 client.on('guildUpdate', async (oldGuild, newGuild) => {
     if (!antiNukeEnabled) return;
+    
     const changes = [];
     if (oldGuild.name !== newGuild.name) changes.push('NAME');
     if (oldGuild.icon !== newGuild.icon) changes.push('ICON');
+    
     if (changes.length) {
-        const updater = await getAuditLogUltraFast(newGuild, 'GUILD_UPDATE');
-        if (updater && await instantKick(updater, '🚨 Server spam (0.5s)')) {
-            return;
-        }
-        setTimeout(() => massKick(newGuild, 'Server spam'), 50);
+        scoreThreat(newGuild.id);
+        const executor = await getThreatExecutor(newGuild, 'GUILD_UPDATE');
+        if (executor) await eliteKick(executor, `🚨 Server ${changes.join('/')}`);
     }
 });
 
+// 👥 MEMBER EVENTS
 client.on('guildMemberAdd', async (member) => {
-    if (!antiNukeEnabled) return;
-    console.log(`👤 [${member.guild.name}] ${member.user.tag} joined`);
+    if (!antiNukeEnabled || member.user.bot) return;
+    
+    console.log(`👤 NEW [${member.guild.name}] ${member.user.tag}`);
+    
+    // Auto-kick suspicious new accounts (pentest only)
+    if (Date.now() - member.user.createdTimestamp < 7 * 24 * 60 * 60 * 1000) { // <7 days
+        setTimeout(() => {
+            if (member.kickable && !isWhitelisted(member)) {
+                eliteKick(member, '🚨 Suspicious new account');
+            }
+        }, 1000);
+    }
 });
 
-// Commands (unchanged)
+client.on('guildMemberRemove', async (member) => {
+    console.log(`👋 LEFT [${member.guild.name}] ${member.user.tag}`);
+});
+
+// 🛠️ ENHANCED SLASH COMMANDS
 client.on('interactionCreate', async (interaction) => {
     if (!interaction.isChatInputCommand()) return;
     
@@ -238,7 +377,7 @@ client.on('interactionCreate', async (interaction) => {
     
     if (!canUseCommands(userId, guild)) {
         return interaction.reply({ 
-            content: `❌ **ACCESS DENIED**\n🔒 Server Owner + 1184454687865438218 only\n👮‍♂️ Admins BLOCKED`, 
+            content: `🚫 **ELITE ACCESS DENIED**\n🔒 **Server Owner + 1184454687865438218 ONLY**\n⚡ All others PERMANENTLY BLOCKED`, 
             ephemeral: true 
         });
     }
@@ -246,76 +385,138 @@ client.on('interactionCreate', async (interaction) => {
     const { commandName } = interaction;
     
     try {
-        if (commandName === 'antinode') {
-            antiNukeEnabled = !antiNukeEnabled;
-            await interaction.reply({ content: `🛡️ **Anti-Nuke ${antiNukeEnabled ? '🟢 ON' : '🔴 OFF'}**`, ephemeral: true });
+        switch (commandName) {
+            case 'antinode':
+                antiNukeEnabled = !antiNukeEnabled;
+                await interaction.reply({ 
+                    content: `🛡️ **ANTI-NUKE v5.7 ${antiNukeEnabled ? '🟢 ELITE ACTIVE' : '🔴 DISABLED'}**\n⚡ ${antiNukeEnabled ? '15ms kicks | 250ms audits' : 'OFFLINE'}`, 
+                    ephemeral: true 
+                });
+                break;
+                
+            case 'add-trust':
+                const trustUser = interaction.options.getUser('user');
+                trustedUsers.add(trustUser.id);
+                await interaction.reply({ content: `✅ **${trustUser.tag}** ✅ ADDED TO ELITE TRUST LIST`, ephemeral: true });
+                break;
+                
+            case 'remove-trust':
+                const untrustUser = interaction.options.getUser('user');
+                trustedUsers.delete(untrustUser.id);
+                await interaction.reply({ content: `❌ **${untrustUser.tag}** ❌ REMOVED FROM TRUST`, ephemeral: true });
+                break;
+                
+            case 'add-role':
+                const role = interaction.options.getRole('role');
+                whitelistRolesSet.add(role.id);
+                await interaction.reply({ content: `✅ **${role.name}** ✅ WHITELISTED (all members)`, ephemeral: true });
+                break;
+                
+            case 'status':
+                const statusEmbed = new EmbedBuilder()
+                    .setTitle('🚀 ANTI-NUKE v5.7 - ELITE STATUS')
+                    .setDescription('**SUB-250ms ELITE PROTECTION**')
+                    .addFields(
+                        { name: '🛡️ Status', value: antiNukeEnabled ? '🟢 **ELITE ACTIVE**' : '🔴 **OFFLINE**', inline: true },
+                        { name: '👥 Servers', value: `${client.guilds.cache.size}`, inline: true },
+                        { name: '🔒 Trusted', value: `${trustedUsers.size}`, inline: true },
+                        { name: '📋 Roles', value: `${whitelistRolesSet.size}`, inline: true },
+                        { name: '⚡ Kill Speed', value: '**15ms** kicks | **250ms** audits', inline: false },
+                        { name: '📊 Active Threats', value: `${activeThreats.size}`, inline: true },
+                        { name: '🚫 Rate Limited', value: `${rateLimitedGuilds.size}`, inline: true },
+                        { name: '🔐 Authorized', value: `Owner + ${config.authorizedCommandUsers.length}`, inline: true }
+                    )
+                    .setColor(antiNukeEnabled ? 0x00ff88 : 0xff4444)
+                    .setThumbnail(client.user.displayAvatarURL())
+                    .setTimestamp();
+                    
+                await interaction.reply({ embeds: [statusEmbed] });
+                break;
+                
+            case 'masskick':
+                const kickCount = interaction.options.getInteger('count') || config.maxMembersPerKick;
+                await interaction.reply({ 
+                    content: `💥 **ELITE MASS KICK STARTED**\n⚡ **${kickCount}** targets | **15ms** speed`, 
+                    ephemeral: true 
+                });
+                eliteMassKick(interaction.guild, '🚨 MANUAL ELITE KICK', kickCount);
+                break;
+                
+            case 'threatscan':
+                const threats = Array.from(activeThreats.entries())
+                    .map(([id, data]) => `<#${id}> (${data.count})`)
+                    .join('\n') || '🟢 No active threats';
+                    
+                await interaction.reply({ 
+                    content: `📊 **THREAT SCAN**\n\`\`\`\n${threats}\n\`\`\``, 
+                    ephemeral: true 
+                });
+                break;
         }
-        
-        if (commandName === 'add-trust') {
-            const user = interaction.options.getUser('user');
-            trustedUsers.add(user.id);
-            await interaction.reply({ content: `✅ **${user.tag}** trusted`, ephemeral: true });
-        }
-        
-        if (commandName === 'remove-trust') {
-            const user = interaction.options.getUser('user');
-            trustedUsers.delete(user.id);
-            await interaction.reply({ content: `❌ **${user.tag}** untrusted`, ephemeral: true });
-        }
-        
-        if (commandName === 'add-role') {
-            const role = interaction.options.getRole('role');
-            whitelistRolesSet.add(role.id);
-            await interaction.reply({ content: `✅ **${role.name}** whitelisted`, ephemeral: true });
-        }
-        
-        if (commandName === 'status') {
-            const embed = new EmbedBuilder()
-                .setTitle('🛡️ Anti-Nuke v4.9 - 0.5s KILLER')
-                .addFields(
-                    { name: 'Status', value: antiNukeEnabled ? '🟢 ACTIVE' : '🔴 OFF', inline: true },
-                    { name: 'Trusted', value: `${trustedUsers.size}`, inline: true },
-                    { name: 'Roles', value: `${whitelistRolesSet.size}`, inline: true },
-                    { name: 'Servers', value: `${client.guilds.cache.size}`, inline: true },
-                    { name: '⚡ Kill Speed', value: '**0.5s** (rename/webhook)', inline: false },
-                    { name: '🔒 Commands', value: 'Owner + 1184454687865438218', inline: true }
-                )
-                .setColor(antiNukeEnabled ? 0x00ff88 : 0xff4444);
-            await interaction.reply({ embeds: [embed] });
-        }
-        
-        if (commandName === 'masskick') {
-            await interaction.reply({ content: '💥 **Mass kick started** (25ms speed)', ephemeral: true });
-            massKick(interaction.guild, 'Emergency');
-        }
-        
     } catch (e) {
-        await interaction.reply({ content: '❌ Failed', ephemeral: true }).catch(() => {});
+        await interaction.reply({ content: `❌ **ELITE ERROR**: \`${e.message.slice(0,50)}\``, ephemeral: true }).catch(() => {});
     }
 });
 
 client.once('ready', async () => {
-    console.log(`\n✅ Anti-Nuke v4.9 LIVE | ${client.guilds.cache.size} servers`);
-    console.log(`⚡ 0.5s KILLER: Rename/Webhook/Channel = INSTANT KICK`);
-    console.log(`🏎️ 400ms audit timeout + 1s window`);
-    console.log(`🔒 Owner + 1184454687865438218 only`);
+    console.log(`\n✅🚀 ANTI-NUKE v5.7 ELITE LIVE | ${client.guilds.cache.size} SERVERS PROTECTED`);
+    console.log(`⚡ STATS: 15ms kicks | 250ms audits | 750ms threat window | ${config.maxMembersPerKick} max/batch`);
+    console.log(`🔒 AUTHORIZED: Owner + 1184454687865438218`);
+    console.log(`🛡️ WHITELIST: ${trustedUsers.size} users | ${whitelistRolesSet.size} roles`);
     
-    const commands = [
-        { name: 'antinode', description: 'Toggle anti-nuke' },
-        { name: 'add-trust', description: 'Trust user', options: [{ name: 'user', type: 6, required: true }] },
-        { name: 'remove-trust', description: 'Untrust user', options: [{ name: 'user', type: 6, required: true }] },
-        { name: 'add-role', description: 'Whitelist role', options: [{ name: 'role', type: 8, required: true }] },
-        { name: 'status', description: 'Status' },
-        { name: 'masskick', description: 'Emergency kick' }
+    // ENHANCED SLASH COMMANDS
+    const eliteCommands = [
+        { name: 'antinode', description: '🛡️ Toggle elite anti-nuke protection' },
+        { 
+            name: 'add-trust', 
+            description: '✅ Add user to elite whitelist', 
+            options: [{ name: 'user', type: 6, description: 'User to trust', required: true }]
+        },
+        { 
+            name: 'remove-trust', 
+            description: '❌ Remove user from whitelist', 
+            options: [{ name: 'user', type: 6, description: 'User to untrust', required: true }]
+        },
+        { 
+            name: 'add-role', 
+            description: '✅ Whitelist entire role', 
+            options: [{ name: 'role', type: 8, description: 'Role to whitelist', required: true }]
+        },
+        { name: 'status', description: '📊 Elite status dashboard' },
+        { 
+            name: 'masskick', 
+            description: '💥 Emergency elite mass kick', 
+            options: [{ name: 'count', type: 10, description: 'Max members (default 100)', required: false }]
+        },
+        { name: 'threatscan', description: '📊 Scan active threats' }
     ];
 
-    await client.application.commands.set(commands);
+    await client.application.commands.set(eliteCommands);
     
-    const statuses = ['⚡ 0.5s Selfbot Killer', '🚨 Rename=DEAD', '🔒 Owner only'];
-    let i = 0;
+    // ELITE STATUS ROTATION
+    const eliteStatuses = [
+        '⚡ 15ms Selfbot Killer',
+        '🚨 Rename=DEAD (250ms)',
+        '💥 Webhook=INSTANT',
+        '🛡️ v5.7 Elite Protection',
+        `🔒 ${client.guilds.cache.size} servers`,
+        '📊 Threat scoring ACTIVE'
+    ];
+    
+    let statusIndex = 0;
     setInterval(() => {
-        client.user.setActivity(statuses[i++ % statuses.length], { type: ActivityType.Watching });
-    }, 6000);
+        client.user.setActivity(eliteStatuses[statusIndex++ % eliteStatuses.length], { 
+            type: ActivityType.Watching 
+        });
+    }, 5000);
+    
+    // CLEANUP INTERVAL
+    setInterval(() => {
+        const now = Date.now();
+        for (const [guildId, timeout] of rateLimitedGuilds.entries()) {
+            if (now - timeout > 15000) rateLimitedGuilds.delete(guildId);
+        }
+    }, 10000);
 });
 
 client.login(config.token);
