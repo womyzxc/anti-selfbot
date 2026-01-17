@@ -1,5 +1,5 @@
 require('dotenv').config();
-const { Client, GatewayIntentBits, ActivityType, EmbedBuilder, PermissionsBitField } = require('discord.js');
+const { Client, GatewayIntentBits, ActivityType, PermissionsBitField } = require('discord.js');
 
 const config = {
     token: process.env.DISCORD_TOKEN,
@@ -19,11 +19,12 @@ let antiNukeEnabled = true;
 let trustedUsers = new Set(config.trustedIds);
 let whitelistRolesSet = new Set(config.whitelistRoles);
 let processingGuilds = new Set();
+let renamedChannels = new Map(); // ✅ NEW: Track renamed channels
 
-console.log('🔥 ANTI-NUKE v6.1 - FIXED & READY');
-console.log('⚡ 10ms kicks | 200ms audits | WEBHOOK/RENAME KILLER');
+console.log('🔥 ANTI-NUKE v6.2 - AUTO-REVERT FIXED');
+console.log('⚡ 10ms kicks | 200ms audits | RENAME → KICK + REVERT');
 
-const client = new Client({  // ✅ FIXED: Added 'new'
+const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildMembers,
@@ -54,20 +55,14 @@ function canUseCommands(userId, guild) {
 async function getWebhookRenamerExecutor(guild) {
     try {
         const auditLogs = await Promise.race([
-            guild.fetchAuditLogs({ 
-                limit: 1, 
-                type: 'WEBHOOK_CREATE' 
-            }),
+            guild.fetchAuditLogs({ limit: 1, type: 'WEBHOOK_CREATE' }),
             new Promise((_, reject) => 
                 setTimeout(() => reject(new Error('TIMEOUT')), config.auditTimeoutMs)
             )
         ]);
         
-        const webhookEntry = auditLogs.entries.find(entry => 
-            Date.now() - entry.createdTimestamp < config.threatWindowMs
-        );
-        
-        if (webhookEntry) {
+        const webhookEntry = auditLogs.entries.first();
+        if (webhookEntry && Date.now() - webhookEntry.createdTimestamp < config.threatWindowMs) {
             const executor = guild.members.cache.get(webhookEntry.executor.id);
             if (executor && !isWhitelisted(executor)) {
                 console.log(`🎯 WEBHOOK EXECUTOR: ${executor.user.tag}`);
@@ -81,21 +76,16 @@ async function getWebhookRenamerExecutor(guild) {
 async function getChannelRenamerExecutor(guild) {
     try {
         const auditLogs = await Promise.race([
-            guild.fetchAuditLogs({ 
-                limit: 1, 
-                type: 'CHANNEL_UPDATE' 
-            }),
+            guild.fetchAuditLogs({ limit: 1, type: 'CHANNEL_UPDATE' }),
             new Promise((_, reject) => 
                 setTimeout(() => reject(new Error('TIMEOUT')), config.auditTimeoutMs)
             )
         ]);
         
-        const renameEntry = auditLogs.entries.find(entry => 
-            Date.now() - entry.createdTimestamp < config.threatWindowMs &&
-            entry.changes.some(change => change.key === 'name')
-        );
-        
-        if (renameEntry) {
+        const renameEntry = auditLogs.entries.first();
+        if (renameEntry && Date.now() - renameEntry.createdTimestamp < config.threatWindowMs &&
+            renameEntry.changes.some(change => change.key === 'name')) {
+            
             const executor = guild.members.cache.get(renameEntry.executor.id);
             if (executor && !isWhitelisted(executor)) {
                 console.log(`🎯 RENAMER EXECUTOR: ${executor.user.tag}`);
@@ -113,11 +103,22 @@ async function eliteKick(member, reason) {
     }
     
     try {
-        await member.kick(`ANTI-NUKE-v6.1|${reason}`);
+        await member.kick(`ANTI-NUKE-v6.2|${reason}`);
         console.log(`⚡ KICK ${Date.now()}: ${member.user.tag} (${reason})`);
         return true;
     } catch (e) {
         console.log(`❌ KICK FAIL ${member.user.tag}: ${e.message.slice(0,30)}`);
+        return false;
+    }
+}
+
+async function revertChannelName(channel, originalName) {
+    try {
+        await channel.setName(originalName, 'ANTI-NUKE AUTO-REVERT');
+        console.log(`🔄 REVERTED ${channel.name} → ${originalName}`);
+        return true;
+    } catch (e) {
+        console.log(`❌ REVERT FAIL ${channel.name}: ${e.message.slice(0,30)}`);
         return false;
     }
 }
@@ -158,19 +159,38 @@ client.on('webhookCreate', async (webhook) => {
     setTimeout(() => eliteMassKick(webhook.guild, 'WEBHOOK_FAILSAFE'), 50);
 });
 
-// 🔥 CHANNEL RENAME HANDLER
+// 🔥 FIXED CHANNEL RENAME + AUTO-REVERT
 client.on('channelUpdate', async (oldChannel, newChannel) => {
     if (oldChannel.name === newChannel.name) return;
     if (!antiNukeEnabled) return;
     
-    console.log(`🚨 RENAME [${Date.now()}] ${oldChannel.name} → ${newChannel.name}`);
+    console.log(`🚨 RENAME DETECTED [${Date.now()}]`);
+    console.log(`📝 OLD: "${oldChannel.name}" → NEW: "${newChannel.name}"`);
     
+    // ✅ STEP 1: IMMEDIATE EXECUTOR KICK
     const executor = await getChannelRenamerExecutor(newChannel.guild);
     if (executor && await eliteKick(executor, 'CHANNEL_RENAME')) {
-        newChannel.setName(oldChannel.name).catch(() => {});
+        console.log(`✅ KICKED + STORING FOR REVERT: ${newChannel.id}`);
+        
+        // ✅ STEP 2: STORE FOR AUTO-REVERT
+        renamedChannels.set(newChannel.id, {
+            originalName: oldChannel.name,
+            timestamp: Date.now()
+        });
+        
+        // ✅ STEP 3: FORCE REVERT WITH RETRY
+        setTimeout(async () => {
+            const revertData = renamedChannels.get(newChannel.id);
+            if (revertData) {
+                await revertChannelName(newChannel, revertData.originalName);
+                renamedChannels.delete(newChannel.id); // ✅ CLEANUP
+            }
+        }, 100); // 100ms delay for stability
+        
         return;
     }
     
+    // FAILSAFE
     setTimeout(() => eliteMassKick(newChannel.guild, 'RENAME_FAILSAFE'), 50);
 });
 
@@ -200,14 +220,12 @@ async function getThreatExecutor(guild, actionType) {
             new Promise((_, reject) => setTimeout(() => reject(), config.auditTimeoutMs))
         ]);
         
-        const entry = auditLogs.entries.find(e => 
-            Date.now() - e.createdTimestamp < config.threatWindowMs
-        );
-        
-        return entry ? guild.members.cache.get(entry.executor.id) : null;
-    } catch (e) {
-        return null;
-    }
+        const entry = auditLogs.entries.first();
+        if (entry && Date.now() - entry.createdTimestamp < config.threatWindowMs) {
+            return guild.members.cache.get(entry.executor.id);
+        }
+    } catch (e) {}
+    return null;
 }
 
 // 🛠️ COMMANDS
@@ -225,13 +243,13 @@ client.on('interactionCreate', async (interaction) => {
 });
 
 client.once('ready', () => {
-    console.log(`✅ v6.1 LIVE - WEBHOOK/RENAME READY`);
+    console.log(`✅ v6.2 LIVE - AUTO-REVERT ENABLED`);
     
     client.application.commands.set([
         { name: 'antinode', description: 'Toggle anti-nuke' }
     ]);
     
-    client.user.setActivity('🔥 v6.1 WEBHOOK KILLER', { type: ActivityType.Watching });
+    client.user.setActivity('🔥 v6.2 RENAME KILLER', { type: ActivityType.Watching });
 });
 
 client.login(config.token);
