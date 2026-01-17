@@ -5,18 +5,18 @@ const config = {
     token: process.env.DISCORD_TOKEN,
     trustedIds: process.env.TRUSTED_IDS ? process.env.TRUSTED_IDS.split(',') : ['1184454687865438218'],
     authorizedCommandUsers: ['1184454687865438218'],
-    kickDelayMs: parseInt(process.env.KICK_DELAY) || 8,      // 8ms ULTRA
-    auditTimeoutMs: parseInt(process.env.AUDIT_TIMEOUT) || 120, // 120ms SELF-BOT SPEED
-    threatWindowMs: parseInt(process.env.THREAT_WINDOW) || 250  // 250ms selfbot window
+    kickDelayMs: parseInt(process.env.KICK_DELAY) || 8,      
+    auditTimeoutMs: parseInt(process.env.AUDIT_TIMEOUT) || 120,
+    threatWindowMs: 1000  
 };
 
 let antiNukeEnabled = true;
 let trustedUsers = new Set(config.trustedIds);
 let processingGuilds = new Set();
-let threatScores = new Map(); // User threat scoring
+let threatScores = new Map();
 
-console.log('🔥 ANTI-NUKE v6.4 - XEV SELF-BOT KILLER');
-console.log('🎯 Analyzed: rainy/0x → INSTANT EXECUTOR KILL');
+console.log('OfficialX Anti Nuke Bot Security');
+console.log('🎯 Analyzed: nuke → INSTANT EXECUTOR KILL');
 
 const client = new Client({
     intents: [
@@ -32,6 +32,10 @@ const client = new Client({
     ]
 });
 
+let channelCreationTimes = new Map();
+let webhookCreationTimes = new Map();
+let lastWebhookSent = new Map();
+
 function isWhitelisted(member) {
     return trustedUsers.has(member.id) || 
            (member?.user?.bot && member.user.id !== member.guild.ownerId);
@@ -42,33 +46,29 @@ function addThreatScore(userId, guildId, points) {
     const score = (threatScores.get(key) || 0) + points;
     threatScores.set(key, score);
     console.log(`⚡ THREAT ${key}: ${score}pts (+${points})`);
-    return score >= 2; // 2+ = EXECUTE
+    return score >= 2; 
 }
 
-// ✅ SELF-BOT PATTERN DETECTOR (create_text_channel → rename → webhook)
 async function getSelfbotExecutor(guild, actionType) {
     try {
         const auditLogs = await Promise.race([
             guild.fetchAuditLogs({ 
-                limit: 10,  // 🎯 MORE LOGS = CATCHES MASS CREATE/RENAME
+                limit: 1,
                 type: actionType 
             }),
             new Promise((_, reject) => setTimeout(() => reject(), config.auditTimeoutMs))
         ]);
         
-        // 🎯 MOST RECENT EXECUTOR IN 250ms WINDOW
-        const recentEntry = auditLogs.entries
-            .filter(e => Date.now() - e.createdTimestamp < config.threatWindowMs)
-            .first();
-            
-        if (recentEntry) {
-            const executorId = recentEntry.executor.id;
-            if (!isWhitelisted({ id: executorId })) {
-                console.log(`🎯 SELF-BOT HIT [${actionType}]: ${recentEntry.executor.tag}`);
-                return executorId;
-            }
+        const recentEntries = auditLogs.entries
+            .filter(e => Date.now() - e.createdTimestamp < config.threatWindowMs);
+
+        if (recentEntries.length > 0) {
+            const executorId = recentEntries[0].executor.id;
+            return executorId;
         }
-    } catch (e) {}
+    } catch (e) {
+        console.error(`[ERROR] Executor detection failed: ${e.message}`);
+    }
     return null;
 }
 
@@ -78,72 +78,83 @@ async function instaKill(userId, guild, reason) {
         console.log(`⏭️ WHITELISTED: ${member?.user.tag}`);
         return false;
     }
-    
+
+    if (!guild.me.permissions.has(PermissionsBitField.Flags.KickMembers)) {
+        console.log(`❌ Bot does not have kick permissions in ${guild.name}`);
+        return false;
+    }
+
     try {
-        await member.kick(`ANTI-NUKE-v6.4|${reason}`);
+        await member.kick(`OfficialX|${reason}`);
         console.log(`💀 SELF-BOT KILLED: ${member.user.tag} (${reason})`);
         threatScores.delete(`${guild.id}:${userId}`);
         return true;
     } catch (e) {
-        console.log(`❌ KICK FAIL: ${e.message.slice(0,25)}`);
+        console.log(`❌ KICK FAIL: ${e.message.slice(0, 25)}`);
         return false;
     }
 }
 
-// 🔥 RAINY/0x MASS CREATE DETECTOR
 client.on('channelCreate', async (channel) => {
     if (!antiNukeEnabled) return;
-    
-    console.log(`🚨 CHANNEL CREATE [${Date.now()}] ${channel.name}`);
-    
-    const executorId = await getSelfbotExecutor(channel.guild, 'CHANNEL_CREATE');
-    if (executorId && addThreatScore(executorId, channel.guild.id, 3)) {
-        await instaKill(executorId, channel.guild, 'RAINY_CREATE');
-        channel.delete('ANTI-NUKE').catch(() => {});
+
+    const currentTime = Date.now();
+    let creationTimes = channelCreationTimes.get(channel.guild.id) || [];
+    creationTimes.push(currentTime);
+    channelCreationTimes.set(channel.guild.id, creationTimes);
+
+    creationTimes = creationTimes.filter(time => currentTime - time < 1000);
+
+    if (creationTimes.length > 0) {
+        console.log(`🚨 CHANNEL CREATION DETECTED: ${channel.guild.name}`);
+        const executorId = await getSelfbotExecutor(channel.guild, 'CHANNEL_CREATE');
+        if (executorId) {
+            await instaKill(executorId, channel.guild, 'CHANNEL_CREATE');
+            channel.delete('ANTI-NUKE').catch(() => {});
+        }
     }
 });
 
-// 🔥 RENAME DETECTOR (rainy/0x rename_channels())
-client.on('channelUpdate', async (oldChannel, newChannel) => {
-    if (oldChannel.name === newChannel.name) return;
-    if (!antiNukeEnabled) return;
-    
-    console.log(`🚨 RENAME [${Date.now()}] "${oldChannel.name}" → "${newChannel.name}"`);
-    
-    const executorId = await getSelfbotExecutor(newChannel.guild, 'CHANNEL_UPDATE');
-    if (executorId && addThreatScore(executorId, newChannel.guild.id, 2)) {
-        await instaKill(executorId, newChannel.guild, 'SELF-BOT_RENAME');
-        // AUTO-REVERT
-        newChannel.setName(oldChannel.name, 'ANTI-NUKE').catch(() => {});
-        return;
-    }
-});
-
-// 🔥 WEBHOOK DETECTOR (create_and_spam_webhook())
 client.on('webhookCreate', async (webhook) => {
     if (!antiNukeEnabled) return;
-    
-    console.log(`🚨 WEBHOOK CREATE [${Date.now()}] ${webhook.name}`);
-    
-    const executorId = await getSelfbotExecutor(webhook.guild, 'WEBHOOK_CREATE');
-    if (executorId && addThreatScore(executorId, webhook.guild.id, 4)) {  // Webhook = 4pts
-        await instaKill(executorId, webhook.guild, 'XEV_WEBHOOK');
-        webhook.delete('ANTI-NUKE').catch(() => {});
-        return;
+
+    const currentTime = Date.now();
+    let creationTimes = webhookCreationTimes.get(webhook.guild.id) || [];
+    creationTimes.push(currentTime);
+    webhookCreationTimes.set(webhook.guild.id, creationTimes);
+
+    creationTimes = creationTimes.filter(time => currentTime - time < 1000);
+
+    if (creationTimes.length > 0) {
+        console.log(`🚨 WEBHOOK CREATION DETECTED: ${webhook.guild.name}`);
+        const executorId = await getSelfbotExecutor(webhook.guild, 'WEBHOOK_CREATE');
+        if (executorId) {
+            await instaKill(executorId, webhook.guild, 'WEBHOOK_CREATE');
+            webhook.delete('ANTI-NUKE').catch(() => {});
+        }
     }
 });
 
-// 🔥 BONUS: Role creates, bans, etc.
-client.on('roleCreate', async (role) => {
-    if (!antiNukeEnabled) return;
-    const executorId = await getSelfbotExecutor(role.guild, 'ROLE_CREATE');
-    if (executorId && addThreatScore(executorId, role.guild.id, 3)) {
-        await instaKill(executorId, role.guild, 'ROLE_SPAM');
-        role.delete('ANTI-NUKE').catch(() => {});
-    }
-});
+async function sendWebhookMessage(session, url, headers, payload) {
+    try {
+        const currentTime = Date.now();
+        if (lastWebhookSent.has(url) && currentTime - lastWebhookSent.get(url) < 1000) {
+            console.log(`${Fore.RED}[!] Rate limited. Skipping this webhook.`);
+            return;
+        }
 
-// 🛠️ Commands
+        const resp = await session.post(url, { json: payload, headers });
+        if (resp.status === 204) {
+            console.log(`${Fore.WHITE}[+] Webhook message sent.`);
+            lastWebhookSent.set(url, Date.now());
+        } else {
+            console.log(`${Fore.YELLOW}[!] Webhook error: ${resp.status}`);
+        }
+    } catch (e) {
+        console.error(`${Fore.RED}[!] Webhook send error: ${e}`);
+    }
+}
+
 client.on('interactionCreate', async (interaction) => {
     if (interaction.commandName === 'antinode' && config.authorizedCommandUsers.includes(interaction.user.id)) {
         antiNukeEnabled = !antiNukeEnabled;
